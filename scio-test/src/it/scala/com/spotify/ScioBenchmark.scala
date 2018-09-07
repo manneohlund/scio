@@ -102,6 +102,8 @@ final case class ScioBenchmarkLogger[F[_]](loggers: BenchmarkLogger[F]*) {
 case class BenchmarkResult(
                             name: String,
                             elapsed: Option[Seconds],
+                            buildNum: Long,
+                            jobId: String,
                             startTime: LocalDateTime,
                             finishTime: Option[LocalDateTime],
                             state: State,
@@ -133,12 +135,14 @@ object BenchmarkResult {
       .toMap
 
     BenchmarkResult(
-      name, Some(elapsedTime), startTime, Some(finishTime),
-      scioResult.state, extraArgs, metrics)
+      name, Some(elapsedTime), circleCIEnv.map(_.buildNum).getOrElse(-1L), job.getId,
+      startTime, Some(finishTime), scioResult.state, extraArgs, metrics)
   }
 
   def streaming(name: String,
+                buildNum: Long,
                 createTime: String,
+                jobId: String,
                 jobMetrics: JobMetrics): BenchmarkResult = {
     val startTime: LocalDateTime = dateTimeParser.parseLocalDateTime(createTime)
 
@@ -148,7 +152,7 @@ object BenchmarkResult {
       .sortBy(_._1)
       .toMap
 
-    BenchmarkResult(name, None, startTime, None, State.RUNNING, Array(), metrics)
+    BenchmarkResult(name, None, buildNum, jobId, startTime, None, State.RUNNING, Array(), metrics)
   }
 }
 
@@ -173,7 +177,7 @@ class DatastoreLogger(metricsToCompare: Set[String]) extends BenchmarkLogger[Try
       val commits = benchmarks.map { benchmark =>
         val entity = dt
           .toEntityBuilder(
-            ScioBenchmarkRun(now, env.gitHash, env.buildNum, benchmark.name))
+            ScioBenchmarkRun(now, env.gitHash, benchmark.buildNum, benchmark.name))
           .setKey(DatastoreHelper
             .makeKey(s"${Kind}_${benchmark.name}", dsKeyId(benchmark, env)).build())
 
@@ -181,6 +185,8 @@ class DatastoreLogger(metricsToCompare: Set[String]) extends BenchmarkLogger[Try
           case Some(period) => Map("Elapsed" -> period.getSeconds.toString) ++ benchmark.metrics
           case _ => benchmark.metrics
         }
+
+        entity.putProperties("dfJobId", DatastoreHelper.makeValue(benchmark.jobId).build())
 
         metrics.foreach {
           case (key, value) =>
@@ -257,7 +263,7 @@ class DatastoreLogger(metricsToCompare: Set[String]) extends BenchmarkLogger[Try
     }
   }
 
-  def dsKeyId(benchmark: BenchmarkResult, env: CircleCIEnv): String = env.buildNum.toString
+  def dsKeyId(benchmark: BenchmarkResult): String = benchmark.toString
 }
 
 final case class ConsoleLogger() extends BenchmarkLogger[Try] {
@@ -266,6 +272,7 @@ final case class ConsoleLogger() extends BenchmarkLogger[Try] {
       PrettyPrint.printSeparator()
       PrettyPrint.print("Benchmark", benchmark.name)
       PrettyPrint.print("Extra arguments", benchmark.extraArgs.mkString(" "))
+      PrettyPrint.print("Dataflow job ID", benchmark.jobId)
       PrettyPrint.print("State", benchmark.state.toString)
       PrettyPrint.print("Create time", benchmark.startTime.toString())
       PrettyPrint.print("Finish time", benchmark.finishTime.map(_.toString()).getOrElse("N/A"))

@@ -344,6 +344,7 @@ lazy val scioTest: Project = Project(
     "org.apache.beam" % "beam-runners-google-cloud-dataflow-java" % beamVersion % "test,it",
     "org.apache.beam" % "beam-sdks-java-core" % beamVersion % "test",
     "org.apache.beam" % "beam-sdks-java-core" % beamVersion % "test" classifier "tests",
+    "com.google.cloud" % "google-cloud-monitoring" % "0.32.0-beta" % "it",
     "org.scalatest" %% "scalatest" % scalatestVersion,
     "org.scalacheck" %% "scalacheck" % scalacheckVersion % "test,it",
     "com.github.alexarchambault" %% "scalacheck-shapeless_1.13" % scalacheckShapelessVersion % "test,it",

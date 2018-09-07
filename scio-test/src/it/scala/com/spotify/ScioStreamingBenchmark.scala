@@ -17,13 +17,22 @@
 
 package com.spotify
 
+import java.lang.management.ManagementFactory
+
 import com.google.api.services.dataflow.model.Job
+import com.google.cloud.monitoring.v3.MetricServiceClient
 import com.google.common.reflect.ClassPath
+import com.google.monitoring.v3.ListTimeSeriesRequest.TimeSeriesView
+import com.google.monitoring.v3.{ProjectName, TimeInterval}
+import com.google.protobuf.Timestamp
+import com.spotify.ScioBenchmarkSettings.circleCIEnv
 import com.spotify.scio._
+import com.sun.management.OperatingSystemMXBean
 import org.apache.beam.sdk.io.GenerateSequence
 import org.apache.beam.sdk.options.StreamingOptions
 import org.joda.time._
 import org.joda.time.format.DateTimeFormat
+import org.slf4j.{Logger, LoggerFactory}
 
 import scala.collection.JavaConverters._
 
@@ -34,6 +43,7 @@ import scala.collection.JavaConverters._
  * that it can run with past Scio releases.
  */
 object ScioStreamingBenchmark {
+
   import DataflowProvider._
   import ScioBenchmarkSettings._
 
@@ -97,7 +107,6 @@ object ScioStreamingBenchmark {
   object StreamingBenchmarkExample extends StreamingBenchmark {
     override def run(sc: ScioContext): Unit = {
       sc.optionsAs[StreamingOptions].setStreaming(true)
-
       sc
         .customInput(
           "testJob",
@@ -108,12 +117,17 @@ object ScioStreamingBenchmark {
         .withFixedWindows(
           duration = org.joda.time.Duration.standardSeconds(10),
           offset = org.joda.time.Duration.ZERO)
-        .map(_ * 10)
+        .map { x =>
+          (1 to 1000).sorted
+          logMemoryMetrics()
+        }
     }
   }
+
 }
 
 object ScioStreamingBenchmarkMetrics {
+
   import DataflowProvider._
   import ScioBenchmarkSettings._
 
@@ -122,47 +136,73 @@ object ScioStreamingBenchmarkMetrics {
     val argz = Args(args)
     val name = argz("name")
     val projectId = argz.getOrElse("project", defaultProjectId)
-    val jobNamePattern = s"sciostreamingbenchmark-$name-\\d+-([a-zA-Z0-9]+)-\\w+".r
+    val jobNamePattern = s"sciostreamingbenchmark-$name-\\d+-([a-zA-Z0-9]+)-(\\d+)-\\w+".r
 
     val jobs = dataflow.projects().jobs().list(projectId)
 
-    val hourlyMetrics = Option(jobs.setFilter("ACTIVE").execute().getJobs)
-      .map { activeJobs =>
-        activeJobs.asScala.flatMap { job =>
-          if (job.getName.toLowerCase.startsWith("sciostreamingbenchmark")) {
-            jobNamePattern.findFirstMatchIn(job.getName).map(_.group(1))
-              .map { benchmarkName =>
-                BenchmarkResult.streaming(
-                  benchmarkName,
-                  job.getCreateTime,
-                  dataflow.projects().jobs().getMetrics(projectId, job.getId).execute())
-              }.orElse {
-              PrettyPrint.print(
-                "Active jobs fetcher",
-                s"Could not parse valid benchmark name from job ${job.getName}")
-              None
-            }
-          } else {
-            None
-          }
-        }.toList
-      }.getOrElse(List())
+    printTimeSeries(projectId)
+
+    val hourlyMetrics =
+      for (
+        activeJobs <- Option(jobs.setFilter("ACTIVE").execute().getJobs);
+        job <- activeJobs.asScala;
+        benchmarkNameAndBuildNum <- jobNamePattern.findFirstMatchIn(job.getName)
+      ) yield {
+        BenchmarkResult.streaming(
+          benchmarkNameAndBuildNum.group(1),
+          benchmarkNameAndBuildNum.group(2).toLong,
+          job.getCreateTime,
+          job.getId,
+          dataflow.projects().jobs().getMetrics(projectId, job.getId).execute()
+        )
+      }
 
     new DatastoreStreamingLogger().log(hourlyMetrics)
+  }
+
+  private def timeFormat(seconds: Long): String = {
+    new LocalDateTime(seconds * 1000).toString
+  }
+
+  // @Todo update with real finalized metric names...
+  private def printTimeSeries(projectId: String): Unit = {
+    val startTime = new LocalDateTime().minusHours(1).toDate.toInstant.toEpochMilli
+
+    MetricServiceClient.create()
+      .listTimeSeries(
+        ProjectName.newBuilder().setProject(projectId).build(),
+        "metric.type=\"logging.googleapis.com/user/heap_usage\"",
+        TimeInterval.newBuilder()
+          .setStartTime(Timestamp.newBuilder().setSeconds(startTime / 1000).build())
+          .setEndTime(Timestamp.newBuilder().setSeconds(System.currentTimeMillis() / 1000).build())
+          .build(),
+        TimeSeriesView.FULL
+      ).iterateAll().asScala.foreach { x =>
+      print(s"\nMetric: ${x.getMetric.getLabelsMap.get("benchmark_name")} / ${x.getMetric.getType}")
+      x.getPointsList.asScala.foreach { point =>
+        print(s"\n[${timeFormat(point.getInterval.getStartTime.getSeconds)} - " +
+          s"${timeFormat(point.getInterval.getEndTime.getSeconds)}] : " +
+          s"${point.getValue.getDistributionValue.getMean}")
+      }
+    }
   }
 }
 
 abstract class StreamingBenchmark {
+  import ScioBenchmarkSettings.circleCIEnv
+
   val name: String = this.getClass.getSimpleName.replaceAll("\\$$", "")
+  val logger: Logger = LoggerFactory.getLogger(getClass)
 
   def run(projectId: String,
           prefix: String,
           args: Array[String]): (String, ScioResult) = {
     val username = sys.props("user.name")
+    val buildNum = circleCIEnv.map(_.buildNum).getOrElse(-1)
 
     val (sc, _) = ContextAndArgs(Array(s"--project=$projectId") ++ args)
     sc.setAppName(name)
-    sc.setJobName(s"$prefix-$name-$username".toLowerCase())
+    sc.setJobName(s"$prefix-$name-$buildNum-$username".toLowerCase())
 
     run(sc)
 
@@ -170,12 +210,30 @@ abstract class StreamingBenchmark {
   }
 
   def run(sc: ScioContext): Unit
+
+  // These logs get converted to labeled Stackdriver metrics via regex matching
+  // setup in Stackdriver UI
+  def logMemoryMetrics(): Unit = {
+    val osBean = ManagementFactory.getOperatingSystemMXBean.asInstanceOf[OperatingSystemMXBean]
+    val memoryBean = ManagementFactory.getMemoryMXBean
+    val label = s"(bench:$name)"
+
+    logger.info(s"$label CPU Usage: ${osBean.getSystemCpuLoad * 100.0}")
+
+    val pMemUsage = (osBean.getTotalPhysicalMemorySize -
+      osBean.getFreePhysicalMemorySize).toDouble / osBean.getTotalPhysicalMemorySize
+    logger.info(s"$label PMem Usage: ${pMemUsage * 100.0}")
+
+    val heapMemory = memoryBean.getHeapMemoryUsage
+    logger.info(s"$label Heap Usage: ${heapMemory.getUsed * 100.0 / heapMemory.getCommitted}")
+  }
 }
 
 class DatastoreStreamingLogger extends DatastoreLogger(ScioBenchmarkSettings.StreamingMetrics) {
-  override def dsKeyId(benchmark: BenchmarkResult, env: CircleCIEnv): String = {
+  override def dsKeyId(benchmark: BenchmarkResult): String = {
     val hoursSinceJobLaunch = hourOffset(benchmark.startTime)
-    s"${env.buildNum}[$hoursSinceJobLaunch]"
+
+    s"${benchmark.buildNum}[$hoursSinceJobLaunch]"
   }
 
   private def hourOffset(startTime: LocalDateTime): String = {
